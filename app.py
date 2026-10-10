@@ -1,8 +1,10 @@
 import math
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -133,6 +135,40 @@ def risk_flags(row: pd.Series) -> list:
     return flags
 
 
+def compatibility_score(track_a: pd.Series, track_b: pd.Series, bpm_tolerance: int = 3) -> float:
+    """Calculate compatibility between two tracks (0-100)."""
+    bpm_a = track_a.get("bpm_est")
+    bpm_b = track_b.get("bpm_est")
+    key_a = track_a.get("key_est", "Unknown")
+    key_b = track_b.get("key_est", "Unknown")
+
+    if pd.isna(bpm_a) or pd.isna(bpm_b):
+        return 0.0
+
+    bpm_gap = abs(float(bpm_a) - float(bpm_b))
+    key_gap = key_distance(key_a, key_b)
+    score = max(0, 100 - (bpm_gap * 6) - (key_gap * 8))
+    return round(max(0, min(100, score)), 1)
+
+
+def build_compatibility_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Build a compatibility matrix between all tracks."""
+    if df.empty or len(df) < 2:
+        return pd.DataFrame()
+
+    n = len(df)
+    matrix = [[0.0] * n for _ in range(n)]
+
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                matrix[i][j] = compatibility_score(df.iloc[i], df.iloc[j])
+            else:
+                matrix[i][j] = 0.0
+
+    return pd.DataFrame(matrix, index=df["filename"].values, columns=df["filename"].values)
+
+
 def transition_recommendations(df: pd.DataFrame, ref_index: int = 0, bpm_tolerance: int = 3) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["track", "bpm_est", "key_est", "compatibility_score", "note"])
@@ -146,13 +182,12 @@ def transition_recommendations(df: pd.DataFrame, ref_index: int = 0, bpm_toleran
         if idx == ref_index:
             continue
 
+        score = compatibility_score(ref, row, bpm_tolerance)
         bpm_val = row.get("bpm_est")
         bpm_gap = abs(float(bpm_val) - float(ref_bpm)) if pd.notna(ref_bpm) and pd.notna(bpm_val) else 999
-        key_gap = key_distance(ref_key, row.get("key_est", "Unknown"))
-        score = max(0, 100 - (bpm_gap * 6) - (key_gap * 8))
 
         if pd.notna(bpm_val):
-            if bpm_gap <= bpm_tolerance and key_gap <= 2:
+            if bpm_gap <= bpm_tolerance:
                 note = "Excellent transition"
             elif bpm_gap <= bpm_tolerance + 4:
                 note = "Good transition"
@@ -165,11 +200,54 @@ def transition_recommendations(df: pd.DataFrame, ref_index: int = 0, bpm_toleran
             "track": row.get("filename", f"track_{idx + 1}"),
             "bpm_est": row.get("bpm_est", math.nan),
             "key_est": row.get("key_est", "Unknown"),
-            "compatibility_score": round(max(0, min(100, score)), 1),
+            "compatibility_score": score,
             "note": note,
         })
 
     return pd.DataFrame(rows).sort_values("compatibility_score", ascending=False).head(10)
+
+
+def build_optimal_set_order(df: pd.DataFrame, max_tracks: int = 10) -> list:
+    """Build an optimal DJ set order using a greedy algorithm."""
+    if df.empty:
+        return []
+
+    clean_df = df[df["risk_score"] < 50].copy()
+    if clean_df.empty:
+        clean_df = df.copy()
+
+    if len(clean_df) > max_tracks:
+        clean_df = clean_df.sort_values("risk_score").head(max_tracks)
+
+    if len(clean_df) < 2:
+        return clean_df.index.tolist()
+
+    # Start with lowest risk track
+    order = [clean_df["risk_score"].idxmin()]
+    remaining = set(clean_df.index) - {order[0]}
+
+    while remaining:
+        current_idx = order[-1]
+        current_track = clean_df.loc[current_idx]
+
+        best_next = None
+        best_score = -1
+
+        for next_idx in remaining:
+            next_track = clean_df.loc[next_idx]
+            compat = compatibility_score(current_track, next_track)
+
+            if compat > best_score:
+                best_score = compat
+                best_next = next_idx
+
+        if best_next is not None:
+            order.append(best_next)
+            remaining.remove(best_next)
+        else:
+            break
+
+    return order
 
 
 def load_data() -> pd.DataFrame:
@@ -186,6 +264,7 @@ def load_data() -> pd.DataFrame:
                 {"filename": "track_03.mp3", "bpm_est": 128, "key_est": "F major", "duration_s": 198, "integrated_lufs": -10.2, "true_peak_dbfs": -2.3, "key_score": 0.71},
                 {"filename": "track_04.mp3", "bpm_est": 116, "key_est": "E minor", "duration_s": 245, "integrated_lufs": -11.8, "true_peak_dbfs": -2.0, "key_score": 0.84},
                 {"filename": "track_05.mp3", "bpm_est": 132, "key_est": "G major", "duration_s": 200, "integrated_lufs": -5.4, "true_peak_dbfs": -0.9, "key_score": 0.68},
+                {"filename": "track_06.mp3", "bpm_est": 120, "key_est": "D minor", "duration_s": 220, "integrated_lufs": -9.2, "true_peak_dbfs": -1.6, "key_score": 0.79},
             ])
 
     df = normalize_columns(df)
@@ -197,7 +276,7 @@ def load_data() -> pd.DataFrame:
 
 def render_dashboard(df: pd.DataFrame):
     st.title("🎧 DJ Prep Dashboard")
-    st.caption("Review batch analysis, detect risky tracks, and shortlist mixing-ready candidates.")
+    st.caption("Review batch analysis, detect risky tracks, build compatible sets, and export shortlists.")
 
     uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
     if uploaded is not None:
@@ -245,20 +324,47 @@ def render_dashboard(df: pd.DataFrame):
     risk_df["risk_flags"] = risk_df["risk_flags"].apply(lambda x: ", ".join(x) if x else "None")
     st.dataframe(risk_df.sort_values("risk_score", ascending=False), use_container_width=True)
 
-    st.subheader("Filtered Track List")
-    st.dataframe(filtered[["filename", "bpm_est", "key_est", "integrated_lufs", "true_peak_dbfs", "risk_score"]], use_container_width=True)
+    st.subheader("Compatibility Matrix")
+    if len(filtered) > 1:
+        matrix = build_compatibility_matrix(filtered)
+        fig = px.imshow(matrix, title="Track Compatibility Scores (0-100)", color_continuous_scale="Viridis", aspect="auto")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Need at least 2 tracks to build compatibility matrix.")
 
-    if not filtered.empty:
-        st.subheader("Recommended DJ Shortlist")
-        shortlist = transition_recommendations(filtered, ref_index=0)
-        if shortlist.empty:
-            st.info("Not enough compatible tracks for recommendations.")
-        else:
-            st.dataframe(shortlist, use_container_width=True)
+    st.subheader("Recommended DJ Set Order")
+    if len(filtered) > 1:
+        optimal_order = build_optimal_set_order(filtered, max_tracks=10)
+        set_tracks = filtered.loc[optimal_order, ["filename", "bpm_est", "key_est", "risk_score"]].reset_index(drop=True)
+        set_tracks.index = set_tracks.index + 1
+        set_tracks.index.name = "Position"
+        st.dataframe(set_tracks, use_container_width=True)
 
-    st.subheader("Suggested Set Order")
-    suggested = filtered.sort_values(["bpm_est", "risk_score"], ascending=[True, False]).head(10)
-    st.dataframe(suggested[["filename", "bpm_est", "key_est", "risk_score", "integrated_lufs"]], use_container_width=True)
+        csv_buffer = StringIO()
+        set_tracks.to_csv(csv_buffer)
+        st.download_button(
+            label="📥 Download Recommended Set as CSV",
+            data=csv_buffer.getvalue(),
+            file_name="recommended_dj_set.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("Not enough clean tracks to build a set.")
+
+    st.subheader("Export Shortlist")
+    shortlist = filtered[["filename", "bpm_est", "key_est", "duration_s", "integrated_lufs", "risk_score"]].copy()
+    shortlist = shortlist.sort_values("risk_score")
+    if not shortlist.empty:
+        csv_buffer = StringIO()
+        shortlist.to_csv(csv_buffer, index=False)
+        st.download_button(
+            label="📥 Download Full Shortlist as CSV",
+            data=csv_buffer.getvalue(),
+            file_name="track_shortlist.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No tracks match the current filters.")
 
 
 def main():
