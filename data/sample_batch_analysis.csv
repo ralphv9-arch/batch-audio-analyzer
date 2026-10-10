@@ -1,0 +1,294 @@
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+st.set_page_config(page_title="DJ Prep Dashboard", page_icon="🎧", layout="wide")
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {
+        "file_name": "filename",
+        "track": "filename",
+        "title": "filename",
+        "track_name": "filename",
+        "song": "filename",
+        "bpm": "bpm_est",
+        "tempo": "bpm_est",
+        "bpm_estimate": "bpm_est",
+        "bpm_estimated": "bpm_est",
+        "key": "key_est",
+        "key_estimate": "key_est",
+        "key_guess": "key_est",
+        "duration": "duration_s",
+        "duration_seconds": "duration_s",
+        "length_seconds": "duration_s",
+        "integrated_lufs": "integrated_lufs",
+        "loudness_integrated_lufs": "integrated_lufs",
+        "lufs": "integrated_lufs",
+        "true_peak_dbfs": "true_peak_dbfs",
+        "true_peak_dbtp": "true_peak_dbfs",
+        "peak_dbfs": "true_peak_dbfs",
+        "key_score": "key_score",
+        "key_confidence": "key_score",
+        "confidence": "key_score",
+    }
+
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Fill default columns if missing
+    if "filename" not in df.columns:
+        df["filename"] = [f"track_{i + 1}" for i in range(len(df))]
+
+    if "bpm_est" not in df.columns:
+        df["bpm_est"] = np.nan
+    if "key_est" not in df.columns:
+        df["key_est"] = "Unknown"
+    if "duration_s" not in df.columns:
+        df["duration_s"] = np.nan
+    if "integrated_lufs" not in df.columns:
+        df["integrated_lufs"] = np.nan
+    if "true_peak_dbfs" not in df.columns:
+        df["true_peak_dbfs"] = np.nan
+    if "key_score" not in df.columns:
+        df["key_score"] = np.nan
+
+    return df
+
+
+def detect_risk_flags(row: pd.Series) -> list:
+    flags = []
+    if pd.notna(row.get("integrated_lufs")) and row["integrated_lufs"] > -4:
+        flags.append("Very loud")
+    if pd.notna(row.get("integrated_lufs")) and row["integrated_lufs"] < -14:
+        flags.append("Very quiet")
+    if pd.notna(row.get("true_peak_dbfs")) and row["true_peak_dbfs"] > -1.5:
+        flags.append("Peak risk")
+    if pd.notna(row.get("key_score")) and row["key_score"] < 0.6:
+        flags.append("Low key confidence")
+    if pd.notna(row.get("bpm_est")) and (row["bpm_est"] < 60 or row["bpm_est"] > 220):
+        flags.append("Unusual BPM")
+    return flags
+
+
+def key_distance(key_a: str, key_b: str) -> float:
+    if pd.isna(key_a) or pd.isna(key_b):
+        return 999.0
+    key_map = {
+        "A": 0, "Am": 0, "A minor": 0,
+        "B♭": 1, "Bb": 1, "A#": 1,
+        "B": 2, "Bm": 2,
+        "C": 3, "Cm": 3,
+        "D♭": 4, "Db": 4, "C#": 4,
+        "D": 5, "Dm": 5,
+        "E♭": 6, "Eb": 6, "D#": 6,
+        "E": 7, "Em": 7,
+        "F": 8, "Fm": 8,
+        "F#": 9, "Gb": 9,
+        "G": 10, "Gm": 10,
+        "A♭": 11, "Ab": 11, "G#": 11,
+    }
+
+    def clean_key(value):
+        value = str(value).strip().lower().replace(" ", "")
+        if value in {"aminor", "am"}:
+            return "Am"
+        if value in {"cb", "b#"}:
+            return "C"
+        if value in {"db", "c#"}:
+            return "Db"
+        if value in {"eb", "d#"}:
+            return "Eb"
+        if value in {"gb", "f#"}:
+            return "Gb"
+        if value in {"ab", "g#"}:
+            return "Ab"
+        if value in {"bb", "a#"}:
+            return "Bb"
+        return value.capitalize()
+
+    a = clean_key(key_a)
+    b = clean_key(key_b)
+    if a not in key_map or b not in key_map:
+        return 999.0
+    return min(abs(key_map[a] - key_map[b]), 12 - abs(key_map[a] - key_map[b]))
+
+
+def transition_recommendations(df: pd.DataFrame, ref_index: int = 0, bpm_tolerance: int = 3) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["track", "bpm_est", "key_est", "compatibility_score", "note"])
+
+    ref = df.iloc[ref_index]
+    ref_bpm = ref.get("bpm_est", np.nan)
+    ref_key = ref.get("key_est", "Unknown")
+
+    recs = []
+    for idx, row in df.iterrows():
+        if idx == ref_index:
+            continue
+        bpm_gap = abs(float(row.get("bpm_est", 0)) - float(ref_bpm)) if pd.notna(ref_bpm) and pd.notna(row.get("bpm_est")) else 999
+        key_gap = key_distance(ref_key, row.get("key_est", "Unknown"))
+        score = max(0, 100 - (bpm_gap * 6) - (key_gap * 8))
+        if pd.notna(row.get("bpm_est")):
+            if bpm_gap <= bpm_tolerance and key_gap <= 2:
+                note = "Excellent transition"
+            elif bpm_gap <= bpm_tolerance + 4:
+                note = "Good transition" 
+            else:
+                note = "Consider a break or energy shift"
+        else:
+            note = "Insufficient tempo data"
+
+        recs.append({
+            "track": row.get("filename", f"track_{idx + 1}"),
+            "bpm_est": row.get("bpm_est", np.nan),
+            "key_est": row.get("key_est", "Unknown"),
+            "compatibility_score": round(max(0, min(100, score)), 1),
+            "note": note,
+        })
+
+    rec_df = pd.DataFrame(recs).sort_values("compatibility_score", ascending=False)
+    return rec_df.head(10)
+
+
+def load_data() -> pd.DataFrame:
+    default_path = Path("data/sample_batch_analysis.csv")
+    if "uploaded_file" in st.session_state and st.session_state["uploaded_file"] is not None:
+        df = pd.read_csv(st.session_state["uploaded_file"])
+    elif default_path.exists():
+        df = pd.read_csv(default_path)
+    else:
+        sample_rows = [
+            {
+                "filename": "track_01.mp3",
+                "bpm_est": 124,
+                "key_est": "A minor",
+                "duration_s": 215,
+                "integrated_lufs": -8.5,
+                "true_peak_dbfs": -1.2,
+                "key_score": 0.92,
+            },
+            {
+                "filename": "track_02.mp3",
+                "bpm_est": 126,
+                "key_est": "C major",
+                "duration_s": 230,
+                "integrated_lufs": -7.2,
+                "true_peak_dbfs": -1.8,
+                "key_score": 0.88,
+            },
+            {
+                "filename": "track_03.mp3",
+                "bpm_est": 128,
+                "key_est": "F major",
+                "duration_s": 198,
+                "integrated_lufs": -10.2,
+                "true_peak_dbfs": -2.3,
+                "key_score": 0.71,
+            },
+            {
+                "filename": "track_04.mp3",
+                "bpm_est": 116,
+                "key_est": "E minor",
+                "duration_s": 245,
+                "integrated_lufs": -11.8,
+                "true_peak_dbfs": -2.0,
+                "key_score": 0.84,
+            },
+        ]
+        df = pd.DataFrame(sample_rows)
+
+    return normalize_columns(df)
+
+
+def render_dashboard(df: pd.DataFrame):
+    df = df.copy()
+    df["risk_flags"] = df.apply(detect_risk_flags, axis=1)
+    df["risk_count"] = df["risk_flags"].apply(len)
+
+    st.title("🎧 DJ Prep Dashboard")
+    st.caption("Batch analysis review, risk detection, and transition recommendations")
+
+    uploaded = st.file_uploader("Upload your batch_analysis.csv", type=["csv"])
+    if uploaded is not None:
+        st.session_state["uploaded_file"] = uploaded
+
+    if df.empty:
+        st.warning("No rows available in the CSV.")
+        return
+
+    st.subheader("Summary")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Tracks", len(df))
+    col2.metric("Avg BPM", f"{df['bpm_est'].mean():.1f}" if pd.notna(df['bpm_est'].mean()) else "N/A")
+    col3.metric("Avg LUFS", f"{df['integrated_lufs'].mean():.1f}" if pd.notna(df['integrated_lufs'].mean()) else "N/A")
+    col4.metric("Risky Tracks", int((df["risk_count"] > 0).sum()))
+
+    filters = st.columns(4)
+    min_bpm = filters[0].number_input("Min BPM", min_value=60, max_value=220, value=80)
+    max_bpm = filters[1].number_input("Max BPM", min_value=60, max_value=220, value=180)
+    key_filter = filters[2].selectbox("Key", ["All"] + sorted(df["key_est"].dropna().unique().tolist()))
+    risk_filter = filters[3].selectbox("Risk filter", ["All", "Risky", "Clean"])
+
+    filtered = df.copy()
+    filtered = filtered[(filtered["bpm_est"].between(min_bpm, max_bpm, inclusive="both"))]
+    if key_filter != "All":
+        filtered = filtered[filtered["key_est"] == key_filter]
+    if risk_filter == "Risky":
+        filtered = filtered[filtered["risk_count"] > 0]
+    elif risk_filter == "Clean":
+        filtered = filtered[filtered["risk_count"] == 0]
+
+    st.subheader("BPM Distribution")
+    bpm_fig = px.histogram(df.dropna(subset=["bpm_est"]), x="bpm_est", nbins=25, title="Estimated BPM distribution")
+    st.plotly_chart(bpm_fig, use_container_width=True)
+
+    st.subheader("Key Distribution")
+    key_counts = df["key_est"].value_counts().reset_index()
+    key_counts.columns = ["Key", "Count"]
+    key_fig = px.bar(key_counts, x="Key", y="Count", title="Key distribution")
+    st.plotly_chart(key_fig, use_container_width=True)
+
+    st.subheader("Risk Flags")
+    risk_rows = []
+    for _, row in df.iterrows():
+        if row["risk_flags"]:
+            risk_rows.append({
+                "filename": row["filename"],
+                "flags": ", ".join(row["risk_flags"]),
+                "bpm_est": row.get("bpm_est"),
+                "integrated_lufs": row.get("integrated_lufs"),
+                "true_peak_dbfs": row.get("true_peak_dbfs"),
+            })
+    if risk_rows:
+        st.dataframe(pd.DataFrame(risk_rows), use_container_width=True)
+    else:
+        st.info("No risky tracks detected.")
+
+    st.subheader("Filtered Track List")
+    st.dataframe(filtered, use_container_width=True)
+
+    if not filtered.empty:
+        st.subheader("Transition Recommendations")
+        recommendations = transition_recommendations(filtered, ref_index=0)
+        st.dataframe(recommendations, use_container_width=True)
+
+    st.subheader("Suggested DJ Set Order")
+    suggested = filtered.sort_values(["bpm_est", "integrated_lufs"], ascending=[True, False]).head(10)
+    st.dataframe(suggested[["filename", "bpm_est", "key_est", "integrated_lufs", "true_peak_dbfs"]], use_container_width=True)
+
+
+def main():
+    try:
+        df = load_data()
+        render_dashboard(df)
+    except Exception as exc:
+        st.error(f"Failed to load dashboard data: {exc}")
+
+
+if __name__ == "__main__":
+    main()
